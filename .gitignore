@@ -1,0 +1,13 @@
+# Build output / CMake cache (regenerate with: cmake -B build && cmake --build build -j)
+build/
+out/
+cmake-build-*/
+
+# Common IDE/editor clutter
+.vs/
+.vscode/
+*.user
+
+# OS cruft
+Thumbs.db
+.DS_Store

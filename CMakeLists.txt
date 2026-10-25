@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.20)
+project(tzu_dash CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+option(TZU_BUILD_UI "Build the OpenGL dashboard (needs network once for glfw + imgui)" ON)
+
+find_package(Threads REQUIRED)
+add_library(tzu INTERFACE)
+target_include_directories(tzu INTERFACE include)
+target_link_libraries(tzu INTERFACE Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(tzu INTERFACE rt)       # shm_open on older glibc
+endif()
+
+add_executable(tzu_tests tests/tests.cpp)
+target_link_libraries(tzu_tests tzu)
+add_executable(tzu_feed src/feed_main.cpp)
+target_link_libraries(tzu_feed tzu)
+
+if(TZU_BUILD_UI)
+  include(FetchContent)
+  FetchContent_Declare(glfw  GIT_REPOSITORY https://github.com/glfw/glfw.git  GIT_TAG 3.4)
+  FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.9)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(glfw imgui)
+  find_package(OpenGL REQUIRED)
+  add_executable(tzu_dash src/main.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+  target_include_directories(tzu_dash PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(tzu_dash tzu glfw OpenGL::GL)
+endif()
