@@ -2,6 +2,9 @@
 // print tape + grade, status tiles. Native OpenGL via Dear ImGui. Consumes tzu::Ring.
 #include "tzu/demo_feed.hpp"
 #include "tzu/engine.hpp"
+#include "tzu/harden.hpp"
+#include "tzu/latency.hpp"
+#include "tzu/logger.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -242,6 +245,9 @@ static void uploadHeat(Engine& e, GLuint tex) {
 }
 
 int main(int argc, char** argv) {
+    tzu::Logger::instance().start();
+    tzu::installSignalHandlers();
+
     std::string shm; Config cfg; float scale = 1.25f;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shm") && i + 1 < argc) shm = argv[++i];
@@ -251,17 +257,19 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--macro")) cfg.macroDay = true;
         else if (!std::strcmp(argv[i], "--short-calls")) cfg.dealerLongCalls = false;
     }
-    Ring ring = shm.empty() ? Ring::heap(1u << 18) : Ring::openShm(shm);
-    std::atomic<bool> stop{false}; std::thread feedThread; std::unique_ptr<Producer> prod; std::unique_ptr<DemoFeed> feed;
-    if (shm.empty()) { prod = std::make_unique<Producer>(ring); feed = std::make_unique<DemoFeed>(*prod); feedThread = std::thread([&] { feed->run(stop); }); }
+    TZU_LOG_INFO("ui", "starting: mode=%s mult=%.1f scale=%.2f", shm.empty() ? "demo" : shm.c_str(), cfg.multiplier, double(scale));
 
-    if (!glfwInit()) return 1;
+    Ring ring = shm.empty() ? Ring::heap(1u << 18) : Ring::openShm(shm);
+    std::thread feedThread; std::unique_ptr<Producer> prod; std::unique_ptr<DemoFeed> feed;
+    if (shm.empty()) { prod = std::make_unique<Producer>(ring); feed = std::make_unique<DemoFeed>(*prod); feedThread = std::thread([&] { feed->run(tzu::shutdownFlag()); }); }
+
+    if (!glfwInit()) { TZU_LOG_ERROR("ui", "glfwInit failed"); tzu::Logger::instance().stop(); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3); glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
     GLFWwindow* win = glfwCreateWindow(1700, 960, "TZU // systematic options", nullptr, nullptr);
-    if (!win) return 1;
+    if (!win) { TZU_LOG_ERROR("ui", "glfwCreateWindow failed"); glfwTerminate(); tzu::Logger::instance().stop(); return 1; }
     glfwMakeContextCurrent(win); glfwSwapInterval(1);
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO(); io.IniFilename = nullptr; io.FontGlobalScale = scale;
     ImGui::StyleColorsDark(); ImGuiStyle& st = ImGui::GetStyle();
@@ -275,11 +283,44 @@ int main(int argc, char** argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, eng.heat.cols(), eng.heat.rows(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
-    while (!glfwWindowShouldClose(win)) {
-        glfwPollEvents();
-        ring.drain([&](const Event& ev) { eng.process(ev); }, 400000);     // never starve the frame
-        const uint64_t now = wallNs(); eng.tick(now); uploadHeat(eng, tex);
+    // Rough per-stage budgets for a 60fps vsync'd frame (~16.6ms, plus FrameRender includes the
+    // vsync wait from glfwSwapBuffers so budgeting it at the monitor refresh interval, not less,
+    // is correct, not generous). Tune once you have a real feed; these are illustrative defaults
+    // so `check()`/the periodic report below has something to compare against from frame one.
+    auto& lat = tzu::LatencyTracker::instance();
+    lat.setBudget(tzu::Stage::RingDrain,     500'000,  5'000'000);
+    lat.setBudget(tzu::Stage::EngineTick,  2'000'000,  8'000'000);
+    lat.setBudget(tzu::Stage::GexRecompute, 1'000'000,  5'000'000);
+    lat.setBudget(tzu::Stage::HeatSample,     200'000,  2'000'000);
+    lat.setBudget(tzu::Stage::FrameRender, 16'000'000, 33'000'000);
+    uint64_t lastReport = 0, lastRingDropped = 0, lastLogDropped = 0;
 
+    while (!glfwWindowShouldClose(win) && !tzu::isShutdownRequested()) {
+        glfwPollEvents();
+        { tzu::StageScope sc(tzu::Stage::RingDrain);
+          ring.drain([&](const Event& ev) { eng.process(ev); }, 400000); }   // never starve the frame
+        const uint64_t now = wallNs();
+        { tzu::StageScope sc(tzu::Stage::EngineTick); eng.tick(now); }
+        uploadHeat(eng, tex);
+
+        if (ring.dropped() != lastRingDropped) {
+            TZU_LOG_WARN("ring", "market-data ring dropped %llu events so far (full ring, consumer too slow)", (unsigned long long)ring.dropped());
+            lastRingDropped = ring.dropped();
+        }
+        if (tzu::Logger::instance().dropped() != lastLogDropped) {
+            lastLogDropped = tzu::Logger::instance().dropped();
+            std::fprintf(stderr, "WARN  [logger  ] dropped %llu log lines (logger queue full)\n", (unsigned long long)lastLogDropped);
+        }
+        if (now - lastReport > 5'000'000'000ull) {
+            for (int i = 0; i < int(tzu::Stage::Count); ++i) {
+                const auto& s = lat.stats(tzu::Stage(i)); if (!s.count) continue;
+                TZU_LOG_INFO("latency", "%s avg=%.1fus max=%.1fus n=%llu", tzu::stageName(tzu::Stage(i)),
+                             s.avgNs() / 1000.0, s.maxNs / 1000.0, (unsigned long long)s.count);
+            }
+            lastReport = now;
+        }
+
+        tzu::StageScope frameScope(tzu::Stage::FrameRender);
         int fw, fh; glfwGetFramebufferSize(win, &fw, &fh);
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         const ImVec2 disp = ImGui::GetIO().DisplaySize;
@@ -300,7 +341,9 @@ int main(int argc, char** argv) {
         ImGui::Render(); glViewport(0, 0, fw, fh); glClearColor(.03f, .024f, .035f, 1); glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData()); glfwSwapBuffers(win);
     }
-    stop = true; if (feedThread.joinable()) feedThread.join();
+    TZU_LOG_INFO("ui", "shutting down (events=%llu dropped=%llu)", (unsigned long long)eng.eventsSeen, (unsigned long long)ring.dropped());
+    tzu::requestShutdown(); if (feedThread.joinable()) feedThread.join();
     ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext(); glfwDestroyWindow(win); glfwTerminate();
+    tzu::Logger::instance().stop();
     return 0;
 }

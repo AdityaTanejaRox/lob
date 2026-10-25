@@ -1,8 +1,16 @@
 #include "tzu/demo_feed.hpp"
 #include "tzu/engine.hpp"
+#include "tzu/harden.hpp"
+#include "tzu/latency.hpp"
+#include "tzu/logger.hpp"
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 using namespace tzu;
 
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); return 1; } } while (0)
@@ -63,5 +71,71 @@ int main() {
         r2.drain([&](const Event& ev) { eng.process(ev); }, 100);
         CHECK(eng.tape.size() == before + 1 && eng.tape[0].sweep && eng.tape[0].nPx == 3 && eng.tape[0].qty == 300);
     }
+
+    // ---- async logger: MPSC queue correctness under concurrent producers ----
+    {
+        using Q = detail::MpscQueue<uint64_t, 1 << 14>;
+        Q q; constexpr int kProducers = 4, kPerProducer = 20000;
+        std::vector<std::thread> producers;
+        for (int p = 0; p < kProducers; ++p)
+            producers.emplace_back([&, p] { for (int i = 0; i < kPerProducer; ++i) { uint64_t v = uint64_t(p) * 1'000'000ull + uint64_t(i); while (!q.tryPush(v)) {} } });
+        std::unordered_set<uint64_t> seen; uint64_t val; size_t total = kProducers * kPerProducer;
+        while (seen.size() < total) if (q.tryPop(val)) seen.insert(val);
+        for (auto& t : producers) t.join();
+        CHECK(seen.size() == total);                                      // no duplicates, nothing lost
+    }
+
+    // ---- async logger: format + level filter + flush-on-stop round trip ----
+    {
+        const char* path = "tzu_logger_test.tmp";
+        FILE* f = std::fopen(path, "w+");
+        CHECK(f != nullptr);
+        Logger::instance().start(f);
+        Logger::instance().setMinLevel(LogLevel::Warn);
+        TZU_LOG_DEBUG("test", "should not appear %d", 1);                 // filtered out below Warn
+        TZU_LOG_WARN("test", "hello %d", 42);
+        Logger::instance().stop();                                        // joins worker + flushes remaining queue
+        std::fflush(f); std::rewind(f);
+        char buf[4096] = {}; const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        std::fclose(f); std::remove(path);
+        CHECK(std::strstr(buf, "should not appear") == nullptr);
+        CHECK(std::strstr(buf, "hello 42") != nullptr);
+        Logger::instance().setMinLevel(LogLevel::Debug);                  // restore default for any later use
+    }
+
+    // ---- harden: shutdown flag round trip + watchdog fires only on real stalls ----
+    {
+        resetShutdown(); CHECK(!isShutdownRequested());
+        requestShutdown(); CHECK(isShutdownRequested());
+        resetShutdown(); CHECK(!isShutdownRequested());
+#if !defined(__linux__)
+        CHECK(pinThread(0) == false); CHECK(setRealtimePriority(1) == false); CHECK(lockMemory() == false);
+#endif
+        std::atomic<bool> fired{false};
+        {
+            Watchdog wd("test", std::chrono::milliseconds(300), [&] { fired = true; });
+            for (int i = 0; i < 8; ++i) { wd.tick(); std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+            CHECK(!fired.load());
+        }
+        {
+            Watchdog wd("test2", std::chrono::milliseconds(150), [&] { fired = true; });
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            CHECK(fired.load());
+        }
+        resetShutdown();                                                  // the fired watchdog above didn't call this; keep state clean regardless
+    }
+
+    // ---- latency budgets: StageScope records real elapsed time; check() flags an impossible budget ----
+    {
+        auto& lt = LatencyTracker::instance();
+        { StageScope sc(Stage::RingDrain); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        CHECK(lt.stats(Stage::RingDrain).count >= 1 && lt.stats(Stage::RingDrain).avgNs() > 0);
+        lt.setBudget(Stage::RingDrain, 1, 1);
+        CHECK(!lt.check());
+        lt.setBudget(Stage::RingDrain, 1'000'000'000ull, 1'000'000'000ull);
+        CHECK(lt.check());
+    }
+
     std::puts("ALL OK"); return 0;
 }

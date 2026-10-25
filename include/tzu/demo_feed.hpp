@@ -6,6 +6,7 @@
 #include "producer.hpp"
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -64,9 +65,13 @@ public:
         if (nowNs - lastOpt_ > 500'000'000ull) refreshOptions(nowNs);
     }
 
-    void run(std::atomic<bool>& stop) {
+    void run(std::atomic<bool>& stop, const std::function<void()>& heartbeat = {}) {
         defs(wallNs());
-        while (!stop.load(std::memory_order_relaxed)) { step(wallNs()); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        while (!stop.load(std::memory_order_relaxed)) {
+            step(wallNs());
+            if (heartbeat) heartbeat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
     }
 
 private:
